@@ -508,12 +508,17 @@ TP = {
     "ambush_others": 1,
     "adv_laser": 1.2,
     "loot_r_early": 160.0,  # go this far for a special weapon in the first two minutes
-    "loot_r_late": 70.0,        # stop chasing a healthy enemy that keeps backing off after this long      # advantage divided by (1 + crowd_pen * other enemies nearby)
+    "loot_r_late": 70.0,
+    "ghost": 1,             # stay quiet near the zone edge instead of moving inward        # stop chasing a healthy enemy that keeps backing off after this long      # advantage divided by (1 + crowd_pen * other enemies nearby)
 }
 try:
     TP.update(json.loads(os.environ.get("MECH_PARAMS", "{}")))
 except Exception:
     pass
+if TP.get("ghost"):
+    # silence and distance: no ambushes, no vulture hunts, only short silent loot detours
+    TP.update({"adv_ambush": 99.0, "adv_vulture": 99.0, "close_d": 30.0,
+               "loot_r_early": 30.0, "loot_r_late": 25.0})
 
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_damage", "gun_rate", "laser_damage",
                 "laser_charge", "lightning_range", "servos", "gun_mag", "sensors",
@@ -878,6 +883,8 @@ class Bot:
             return nc, 0.0
         if nr < 40:
             return nc, nr * 0.45
+        if TP.get("ghost"):
+            return nc, max(0.0, nr - max(18.0, 0.12 * nr))
         return nc, max(0.0, nr * 0.72 - 6)
 
     def pick_goal(self, obs, me):
@@ -895,10 +902,17 @@ class Bot:
         else:
             f = (R - 2) / d
             cands.append((nc[0] + (pos[0] - nc[0]) * f, nc[1] + (pos[1] - nc[1]) * f))
-        for _ in range(140):
-            r = R * math.sqrt(random.random())
-            a = random.random() * TAU
-            cands.append((nc[0] + r * math.cos(a), nc[1] + r * math.sin(a)))
+        if TP.get("ghost"):
+            base = cands[0]
+            for _ in range(90):
+                r = 40.0 * math.sqrt(random.random())
+                a = random.random() * TAU
+                cands.append((base[0] + r * math.cos(a), base[1] + r * math.sin(a)))
+        else:
+            for _ in range(140):
+                r = R * math.sqrt(random.random())
+                a = random.random() * TAU
+                cands.append((nc[0] + r * math.cos(a), nc[1] + r * math.sin(a)))
         for p in cands:
             c = nav.cell(*p)
             c = nav.nearest_free(c, 4)
@@ -909,7 +923,10 @@ class Bot:
                 continue
             cov = nav.cover(c)
             cov = min(cov, 18)
-            s = cov * 2.5 - hdist(pos, q) * 0.12 - self.danger_pen(q, obs) - hdist(q, nc) * 0.03
+            if TP.get("ghost"):
+                s = cov * 2.0 - hdist(pos, q) * 0.25 - self.danger_pen(q, obs)
+            else:
+                s = cov * 2.5 - hdist(pos, q) * 0.12 - self.danger_pen(q, obs) - hdist(q, nc) * 0.03
             for (up, ut) in self.used_spots:
                 if obs["t"] - ut < 120 and hdist(q, up) < 30:
                     s -= 25
@@ -1241,7 +1258,7 @@ class Bot:
         z = obs["zone"]
         cc, cr = z["center"], z["radius"]
         nc, R = self.safe_disc(obs)
-        if (self.goal is None or hdist(self.goal, nc) > R + 4 or t - self.goal_t > 45
+        if (self.goal is None or hdist(self.goal, nc) > R + 4 or (t - self.goal_t > 45 and not TP.get("ghost"))
                 or (self.spotted and t - self.goal_t > 12 and hdist(pos, self.goal) < 8)):
             if self.goal is not None:
                 self.used_spots.append((list(self.goal), t))
@@ -1353,7 +1370,7 @@ class Bot:
             else:
                 speed, boost = 0.4, False   # under 5 m/s: no footstep sounds
         if self.rushing and nav_goal is loot_goal:
-            speed, boost = 1.0, me.get("energy", 0) > 25
+            speed, boost = (0.4, False) if TP.get("ghost") else (1.0, me.get("energy", 0) > 25)
         if rem < 1.5:
             speed = 0.0
 

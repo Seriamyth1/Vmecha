@@ -505,7 +505,10 @@ TP = {
     "chase_s": 6.0,
     "reinf_prior": 12.0,   # seconds until teammates arrive after we open fire (learned per match)
     "hitrun_frac": 0.8,    # leave a fight at this fraction of the learned reinforcement time
-    "ambush_others": 1,        # stop chasing a healthy enemy that keeps backing off after this long      # advantage divided by (1 + crowd_pen * other enemies nearby)
+    "ambush_others": 1,
+    "adv_laser": 1.2,
+    "loot_r_early": 160.0,  # go this far for a special weapon in the first two minutes
+    "loot_r_late": 70.0,        # stop chasing a healthy enemy that keeps backing off after this long      # advantage divided by (1 + crowd_pen * other enemies nearby)
 }
 try:
     TP.update(json.loads(os.environ.get("MECH_PARAMS", "{}")))
@@ -679,6 +682,8 @@ class Bot:
         self.reload_obs = []  # observed enemy reload pauses
         self.used_spots = []  # (pos, t) hiding spots used recently
         self.relocate_until = -1
+        self.loot = {}        # pickup id -> (kind, pos, t last seen)
+        self.rushing = False
         self.tracker = Tracker()
         self.local = 0
         gc.collect()
@@ -701,7 +706,7 @@ class Bot:
             if k == "gun":
                 acc = max(0.25, min(1.0, 1.25 - d / 140.0))  # strafing targets dodge at range
             elif k == "laser":
-                acc = 0.8
+                acc = 1.4   # 315 in one instant hit: front-loaded
             elif k == "mortar":
                 acc = 0.35
             else:
@@ -1174,7 +1179,10 @@ class Bot:
             if attacked:
                 stn, pri = ("fight" if adv >= TP["adv_attacked"] else "evade"), 0
             elif m.get("charging") and facing_me and d < 280:
-                stn, pri = ("fight" if adv >= TP["adv_attacked"] else "evade"), 1
+                stn, pri = ("fight" if (laser_i is not None and adv >= TP["adv_laser"]) else "evade"), 1
+            elif "laser" in (m.get("weapons") or []) and facing_me and d < 280 and "laser" in self.enemy_kinds_now(m, t):
+                # an instant 315 hit is coming: only cover helps
+                stn, pri = ("fight" if (laser_i is not None and adv >= TP["adv_laser"]) or d < 40 else "evade"), 1
             elif d < TP["close_d"]:
                 stn, pri = ("fight" if adv >= TP["adv_close"] else "evade"), 2
             elif weak and others == 0 and d < TP["vulture_d"] and adv >= TP["adv_vulture"] and not self.trap_risk(m, pos, t, obs):
@@ -1252,6 +1260,37 @@ class Bot:
         special = [k for k in wk if k and k != "gun"]
         best_rank = max([WEAPON_RANK.get(k, 0) for k in special] or [0])
         empty = None in wk
+        # remember every weapon we have seen lying around; forget ones that vanished
+        vis_ids = set()
+        for p in obs.get("pickups") or []:
+            self.loot[p["id"]] = (p["kind"], p["pos"], t)
+            vis_ids.add(p["id"])
+        near_r = self.cfg["vision"].get("near_range", 45) * 0.8
+        for lid in list(self.loot):
+            k_, lp, lt = self.loot[lid]
+            if lid not in vis_ids and hdist(lp, pos) < near_r and t - lt > 0.5:
+                del self.loot[lid]     # should be in view and is not: someone took it
+        for ev in obs.get("events") or []:
+            if ev.get("type") in ("took", "take_failed") and ev.get("id") in self.loot:
+                del self.loot[ev["id"]]
+        # loot rush: until we hold a special weapon, go get the best one we know of
+        rush = None
+        if best_rank < 3:
+            horizon = TP["loot_r_early"] if t < 120 else TP["loot_r_late"]
+            fighting = target is not None and target.get("kind") == "mech"
+            bs = None
+            for lid, (k_, lp, lt) in self.loot.items():
+                rank = WEAPON_RANK.get(k_, 0)
+                if rank <= best_rank or k_ in wk:
+                    continue
+                if self.nav is not None and lp[2] - self.nav.ground(lp[0], lp[1]) > 2.5:
+                    continue   # on a roof
+                dd = hdist(pos, lp)
+                if dd > horizon or (fighting and dd > 25) or hdist(lp, cc) > cr - 8:
+                    continue
+                sc = dd / (1.0 + 0.5 * rank)
+                if bs is None or sc < bs:
+                    bs, rush = sc, lp
         for p in obs.get("pickups") or []:
             if p["id"] in self.blacklist and t - self.blacklist[p["id"]] < 10:
                 continue
@@ -1275,15 +1314,19 @@ class Bot:
                     else:
                         drop_slot = worst
                 break
-            if quiet and d < 55 and abs(p["pos"][2] - pos[2]) < 3 and hdist(p["pos"], cc) < cr - 10:
+            on_roof = self.nav is not None and p["pos"][2] - self.nav.ground(p["pos"][0], p["pos"][1]) > 2.5
+            if quiet and d < 55 and not on_roof and hdist(p["pos"], cc) < cr - 10:
                 if loot_goal is None or d < hdist(pos, loot_goal):
                     loot_goal = p["pos"]
         if quiet:
             for cu in obs.get("cubes") or []:
                 d = hdist(pos, cu["pos"])
-                if d < 60 and abs(cu["pos"][2] - pos[2]) < 3 and hdist(cu["pos"], cc) < cr - 10:
+                if d < 60 and not (self.nav is not None and cu["pos"][2] - self.nav.ground(cu["pos"][0], cu["pos"][1]) > 2.5) and hdist(cu["pos"], cc) < cr - 10:
                     if loot_goal is None or d < hdist(pos, loot_goal):
                         loot_goal = cu["pos"]
+        if rush is not None and take_id is None:
+            loot_goal = rush
+        self.rushing = rush is not None
         if take_id is not None:
             act["take"] = take_id
             if drop_slot is not None:
@@ -1293,7 +1336,7 @@ class Bot:
         d_cur_edge = cr - hdist(pos, cc)
         outside_next = hdist(pos, nc) > z["next_radius"] - 4
         nav_goal = goal
-        if loot_goal is not None and not outside_next:
+        if loot_goal is not None and (not outside_next or (self.rushing and t < z["shrink_start"] - 15)):
             nav_goal = loot_goal
         mdir, rem = self.follow(me, nav_goal, t)
 
@@ -1309,6 +1352,8 @@ class Bot:
                 speed, boost = 1.0, False
             else:
                 speed, boost = 0.4, False   # under 5 m/s: no footstep sounds
+        if self.rushing and nav_goal is loot_goal:
+            speed, boost = 1.0, me.get("energy", 0) > 25
         if rem < 1.5:
             speed = 0.0
 
@@ -1485,6 +1530,8 @@ class Bot:
                     self.look = (snd["bearing"], t + 1.5)
                 if self.look and t < self.look[1]:
                     look_yaw = self.look[0]
+            if look_yaw is None and t < 3.0:
+                look_yaw = wrap(me["aim"][0] + 1.2)      # opening scan: look all the way round for loot
             if look_yaw is None and self.threats:
                 # face the most pressing remembered threat (weight fades over ~12 s)
                 bestv, by = 0.0, None
